@@ -1,0 +1,344 @@
+/*******************************************************
+ * ESP32 Biomedical Hub (AP + Dashboard + Logging)
+ * Sensors: MAX30102 (Red/IR), MPU6050 (DMP), DS18B20
+ * Web: AP mode, JSON endpoint, HTML dashboard
+ * Logging: SPIFFS CSV (/logs/data.csv), start/stop/download
+ *******************************************************/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <Wire.h>
+
+// --- DS18B20 ---
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// --- MAX30102 (SparkFun MAX3010x) ---
+#include <SparkFun_MAX3010x.h>  // MAX30105.h in older versions
+
+// --- MPU6050 (i2cdevlib) ---
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+
+// -------------------- CONFIG --------------------
+const char* AP_SSID = "ESP32-BioHub";
+const char* AP_PASS = "esp32bio";
+
+const uint8_t PIN_ONEWIRE = 4;   // DS18B20 data pin
+const bool    USE_DMP     = true;
+
+// Sensor sample intervals (ms)
+const uint32_t SAMPLE_PERIOD_MS = 50;   // ~20 Hz sensor loop
+const uint32_t LOG_PERIOD_MS    = 200;  // 5 Hz logging
+
+// Files
+const char* LOG_PATH = "/logs/data.csv";
+
+// ---------------- GLOBALS -----------------------
+WebServer server(80);
+
+// DS18B20
+OneWire oneWire(PIN_ONEWIRE);
+DallasTemperature ds18b20(&oneWire);
+float tempC = NAN;
+
+// MAX30102
+SFE_MAX3010X max3010x;
+bool maxReady = false;
+uint32_t maxRed = 0;
+uint32_t maxIR  = 0;
+
+// MPU6050 + DMP
+MPU6050 mpu;
+bool dmpReady = false;
+uint16_t packetSize;
+uint16_t fifoCount;
+uint8_t fifoBuffer[64];
+Quaternion q;
+VectorFloat gravity;
+float ypr[3] = {0,0,0}; // yaw/pitch/roll in radians
+
+// Timing
+uint32_t tSample = 0;
+uint32_t tLog    = 0;
+
+// Logging control
+bool loggingEnabled = false;
+File logFile;
+
+// Utility: ensure path dirs exist
+bool ensureDir(const String& path) {
+  // SPIFFS does not create nested dirs automatically; use /logs/ directly
+  // We’ll attempt to open directory; if not present, format-friendly approach:
+  File root = SPIFFS.open("/logs");
+  if(!root) {
+    // Try to create a placeholder
+    File f = SPIFFS.open("/logs/.keep","w");
+    if(!f) return false;
+    f.close();
+  }
+  return true;
+}
+
+// --------------- SENSOR SETUP -------------------
+bool setupMAX30102() {
+  if (!max3010x.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("[MAX30102] Not found.");
+    return false;
+  }
+  // Basic config (keep simple for demo—tune as needed)
+  max3010x.setup(); // default setup
+  // You can tune with: max3010x.setPulseAmplitudeRed(0x0A), etc.
+  Serial.println("[MAX30102] OK");
+  return true;
+}
+
+bool setupMPU6050_DMP() {
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("[MPU6050] Connection failed");
+    return false;
+  }
+  if (USE_DMP) {
+    uint8_t devStatus = mpu.dmpInitialize();
+    // Optionally set calibration offsets (example values):
+    // mpu.setXAccelOffset(0); mpu.setYAccelOffset(0); mpu.setZAccelOffset(0);
+    // mpu.setXGyroOffset(0);  mpu.setYGyroOffset(0);  mpu.setZGyroOffset(0);
+
+    if (devStatus == 0) {
+      mpu.setDMPEnabled(true);
+      packetSize = mpu.dmpGetFIFOPacketSize();
+      dmpReady = true;
+      Serial.println("[MPU6050] DMP ready");
+    } else {
+      Serial.printf("[MPU6050] DMP init error: %u\n", devStatus);
+      dmpReady = false;
+    }
+  }
+  return true;
+}
+
+void setupDS18B20() {
+  ds18b20.begin();
+  Serial.println("[DS18B20] Ready");
+}
+
+// --------------- WIFI / WEB ---------------------
+const char* INDEX_HTML = R"HTML(
+<!doctype html><html><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ESP32 Bio Hub</title>
+<style>
+body{font-family:system-ui,Arial;margin:2rem;max-width:800px}
+.card{border:1px solid #ddd;border-radius:12px;padding:1rem;margin:.75rem 0}
+h1{margin:.5rem 0 1rem}
+.row{display:flex;gap:1rem;flex-wrap:wrap}
+.kv{min-width:240px}
+button{padding:.5rem 1rem;border-radius:8px;border:1px solid #333;background:#f5f5f5;cursor:pointer}
+button.run{background:#eaffea;border-color:#108a00}
+button.stop{background:#ffecec;border-color:#b30000}
+pre{white-space:pre-wrap;background:#fafafa;border:1px dashed #ddd;padding:.5rem;border-radius:8px}
+</style>
+</head><body>
+<h1>ESP32 Biomedical Hub</h1>
+
+<div class="row">
+  <div class="card kv"><b>Temperature (DS18B20)</b><div id="tC">--</div></div>
+  <div class="card kv"><b>MAX30102 (Red)</b><div id="red">--</div></div>
+  <div class="card kv"><b>MAX30102 (IR)</b><div id="ir">--</div></div>
+</div>
+
+<div class="card">
+  <b>MPU6050 Yaw / Pitch / Roll (deg)</b>
+  <div>Yaw: <span id="yaw">--</span></div>
+  <div>Pitch: <span id="pitch">--</span></div>
+  <div>Roll: <span id="roll">--</span></div>
+</div>
+
+<div class="card">
+  <b>Logging</b><br/>
+  <button class="run" onclick="fetch('/start').then(()=>loadStatus())">Start</button>
+  <button class="stop" onclick="fetch('/stop').then(()=>loadStatus())">Stop</button>
+  <a href="/download"><button>Download CSV</button></a>
+  <div id="status"></div>
+</div>
+
+<div class="card"><b>Latest JSON</b><pre id="json">{}</pre></div>
+
+<script>
+async function loadStatus(){
+  const r = await fetch('/status'); const t = await r.text();
+  document.getElementById('status').textContent = t;
+}
+async function poll(){
+  try{
+    const r = await fetch('/data');
+    const j = await r.json();
+    document.getElementById('tC').textContent   = (j.tempC ?? NaN).toFixed(2);
+    document.getElementById('red').textContent  = j.maxRed ?? 0;
+    document.getElementById('ir').textContent   = j.maxIR ?? 0;
+    document.getElementById('yaw').textContent  = (j.yaw_deg ?? NaN).toFixed(1);
+    document.getElementById('pitch').textContent= (j.pitch_deg ?? NaN).toFixed(1);
+    document.getElementById('roll').textContent = (j.roll_deg ?? NaN).toFixed(1);
+    document.getElementById('json').textContent = JSON.stringify(j,null,2);
+  }catch(e){}
+}
+setInterval(poll, 1000);
+loadStatus(); poll();
+</script>
+</body></html>
+)HTML";
+
+void handleRoot() { server.send(200, "text/html", INDEX_HTML); }
+
+void handleData() {
+  // Return JSON
+  String json = "{";
+  json += "\"tempC\":" + String(isnan(tempC)?0:tempC, 2) + ",";
+  json += "\"maxRed\":" + String(maxRed) + ",";
+  json += "\"maxIR\":"  + String(maxIR) + ",";
+  float yaw_deg   = ypr[0] * 180.0f / PI;
+  float pitch_deg = ypr[1] * 180.0f / PI;
+  float roll_deg  = ypr[2] * 180.0f / PI;
+  json += "\"yaw_deg\":"   + String(yaw_deg,1)   + ",";
+  json += "\"pitch_deg\":" + String(pitch_deg,1) + ",";
+  json += "\"roll_deg\":"  + String(roll_deg,1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleStart() {
+  loggingEnabled = true;
+  // create/open file and header if empty
+  if (!SPIFFS.exists(LOG_PATH)) {
+    ensureDir("/logs");
+    logFile = SPIFFS.open(LOG_PATH, FILE_WRITE);
+    if (logFile) {
+      logFile.println("millis,tempC,maxRed,maxIR,yaw_deg,pitch_deg,roll_deg");
+      logFile.close();
+    }
+  }
+  server.send(200, "text/plain", "Logging: ON");
+}
+
+void handleStop() {
+  loggingEnabled = false;
+  server.send(200, "text/plain", "Logging: OFF");
+}
+
+void handleStatus() {
+  server.send(200, "text/plain", String("Logging: ") + (loggingEnabled ? "ON" : "OFF"));
+}
+
+void handleDownload() {
+  if (!SPIFFS.exists(LOG_PATH)) {
+    server.send(404, "text/plain", "No log found.");
+    return;
+  }
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+// --------------- SETUP/LOOP ---------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // I2C
+  Wire.begin(21, 22); // SDA, SCL
+
+  // Filesystem
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] Mount failed");
+  } else {
+    ensureDir("/logs");
+  }
+
+  // Sensors
+  setupDS18B20();
+  maxReady = setupMAX30102();
+  setupMPU6050_DMP();
+
+  // WiFi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("[WiFi] AP started: ");
+  Serial.print(AP_SSID);
+  Serial.print("  IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Web routes
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.on("/status", handleStatus);
+  server.on("/download", handleDownload);
+  server.begin();
+  Serial.println("[HTTP] Server listening");
+
+  tSample = millis();
+  tLog = millis();
+}
+
+void loop() {
+  server.handleClient();
+
+  uint32_t now = millis();
+
+  // --- Sample sensors ---
+  if (now - tSample >= SAMPLE_PERIOD_MS) {
+    tSample = now;
+
+    // DS18B20
+    ds18b20.requestTemperatures();
+    tempC = ds18b20.getTempCByIndex(0);
+
+    // MAX30102 (non-blocking quick read of latest)
+    if (maxReady) {
+      // Pull latest samples from FIFO (quick approach)
+      // For robust HR/SpO2, integrate the Maxim algorithm; here we expose raw
+      maxRed = max3010x.getRed();
+      maxIR  = max3010x.getIR();
+    }
+
+    // MPU6050 DMP read
+    if (dmpReady) {
+      fifoCount = mpu.getFIFOCount();
+      if (fifoCount >= packetSize) {
+        // read all available packets, keep the newest
+        while (fifoCount >= packetSize) {
+          mpu.getFIFOBytes(fifoBuffer, packetSize);
+          fifoCount -= packetSize;
+        }
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+      } else if (mpu.getIntStatus() & 0x10) {
+        // FIFO overflow: reset
+        mpu.resetFIFO();
+      }
+    }
+  }
+
+  // --- Logging ---
+  if (loggingEnabled && (now - tLog >= LOG_PERIOD_MS)) {
+    tLog = now;
+    File f = SPIFFS.open(LOG_PATH, FILE_APPEND);
+    if (f) {
+      float yaw_deg   = ypr[0] * 180.0f / PI;
+      float pitch_deg = ypr[1] * 180.0f / PI;
+      float roll_deg  = ypr[2] * 180.0f / PI;
+      f.printf("%lu,%.2f,%u,%u,%.1f,%.1f,%.1f\n",
+               (unsigned long)now,
+               tempC,
+               maxRed,
+               maxIR,
+               yaw_deg, pitch_deg, roll_deg);
+      f.close();
+    }
+  }
+}
